@@ -1,5 +1,7 @@
 # Weird Traveler
 
+**A big part of this code is written with AI.**
+
 An image preview program with a custom file format '.wif'.
 
 The program is three Python scripts plus a shared core library:
