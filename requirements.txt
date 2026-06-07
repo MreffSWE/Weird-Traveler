@@ -1,0 +1,6 @@
+Pillow>=10.0.0
+cryptography>=41.0.0
+# optional – needed to read .avif source images
+# pillow-avif-plugin
+# optional – needed for video thumbnails in the browser
+# opencv-python
