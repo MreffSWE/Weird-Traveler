@@ -4,3 +4,5 @@ cryptography>=41.0.0
 # pillow-avif-plugin
 # optional – needed for video thumbnails in the browser
 # opencv-python
+# optional – needed for WIF v3 spatial filtering (--filter / Convert to WIF v3)
+# numpy

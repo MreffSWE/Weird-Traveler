@@ -14,15 +14,14 @@ Every WIF file begins with the 4-byte signature `w.if` (ASCII, no null terminato
 
 ## Versions
 
-Three versions exist. Version detection is done by inspecting the byte at
-offset 4 (the byte immediately after the magic), with some fallback logic to
-distinguish v0 from v1/v2 when the high byte of a v0 width could be 1 or 2.
+Three versions exist. Version detection reads the version byte at offset 4 (the
+byte immediately after the magic) — it is exact, with no heuristics.
 
 | Version | Description |
 |---------|-------------|
-| **v0** | Legacy — 10-byte header, no version field |
-| **v1** | Current unencrypted format — 11-byte header |
+| **v1** | Unencrypted — 11-byte header, optional zlib |
 | **v2** | Encrypted — variable-length header (no plaintext dimensions) |
+| **v3** | Unencrypted — 11-byte header, optional zlib **and** optional PNG-style spatial filtering |
 
 ---
 
@@ -52,22 +51,52 @@ Struct pattern: `">4sBHHBB"` followed by body.
 
 ---
 
-## v0 — Legacy
+## v3 — Filtered (unencrypted)
 
-Same as v1 but without the version byte. Byte 4 is the high byte of the image
-width (not a version indicator).
+Like v1, but with a **flags byte** and optional **spatial filtering** (PNG-style
+scanline prediction, in `wif_filter.py`) applied to the pixels before zlib.
+Filtering decorrelates neighbouring pixels so the residuals compress far better;
+it is fully reversible (lossless).
 
-### Header (10 bytes, big-endian)
+### Header (11 bytes, big-endian)
 
 | Offset | Size | Type | Value |
 |--------|------|------|-------|
 | 0 | 4 | bytes | Magic: `w.if` |
-| 4 | 2 | uint16 | Image width in pixels |
-| 6 | 2 | uint16 | Image height in pixels |
-| 8 | 1 | uint8 | Channel count: `3` (RGB) or `4` (RGBA) |
-| 9 | 1 | uint8 | Compressed flag: `1` = compressed, `0` = raw |
+| 4 | 1 | uint8 | Version: `3` |
+| 5 | 1 | uint8 | Flags (see below) |
+| 6 | 2 | uint16 | Image width in pixels |
+| 8 | 2 | uint16 | Image height in pixels |
+| 10 | 1 | uint8 | Channel count: `1` (L), `3` (RGB), or `4` (RGBA) |
 
-Body layout is identical to v1.
+Struct pattern: `">4sBBHHB"` followed by body.
+
+### Flags byte (offset 5)
+
+| Bit | Meaning |
+|-----|---------|
+| `0b0001` | Pixels are zlib-compressed |
+| `0b1000` | Pixels were spatially filtered before compression |
+
+Valid values: `0b0000`, `0b0001`, `0b1000`, `0b1001`. (The encrypted and KDF bits
+are never set in v3.)
+
+### Body
+
+The pixel bytes are produced as `filter → zlib`, each step optional and applied
+in that order; decoding reverses it (decompress, then unfilter):
+
+- **Filtered** (`0b1000`): the stream is `[height filter-id bytes] +
+  [height × width × channels filtered bytes]`. Each row chooses the filter that
+  minimises its residuals; ids follow the PNG spec — `0` None, `1` Sub, `2` Up,
+  `3` Average, `4` Paeth. The default ("fast") encoder limits the choice to
+  None/Sub/Up, which invert in one vectorised pass; the full set adds
+  Average/Paeth for a little more saving at the cost of slower decode.
+- **Compressed** (`0b0001`): the (already-filtered, if applicable) bytes run
+  through `zlib.compress(level=6)`.
+
+Spatial filtering needs **numpy** (`wif_filter.py`). Without it, filtered files
+can't be written or read, but plain/compressed v3 files are unaffected.
 
 ---
 
@@ -104,12 +133,14 @@ ciphertext at 34.
 
 | Bit | Meaning |
 |-----|---------|
-| `0b001` | Pixels inside the plaintext are zlib-compressed |
-| `0b010` | File is encrypted (always set in v2) |
-| `0b100` | Header carries scrypt parameters (`log2_n`, `r`, `p`) |
+| `0b0001` | Pixels inside the plaintext are zlib-compressed |
+| `0b0010` | File is encrypted (always set in v2) |
+| `0b0100` | Header carries scrypt parameters (`log2_n`, `r`, `p`) |
+| `0b1000` | Pixels inside the plaintext were spatially filtered (see v3) |
 
-Valid values: `0b010`, `0b011`, `0b110`, `0b111`. New files always set the
-encrypted **and** KDF bits (`0b110`, or `0b111` when compressed).
+New files always set the encrypted **and** KDF bits, plus the compressed and/or
+filtered bits as applicable. Inside the ciphertext the pixels are filtered (if
+set) then compressed (if set) before encryption; decryption reverses the order.
 
 ### Key derivation
 

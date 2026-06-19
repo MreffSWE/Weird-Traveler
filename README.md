@@ -1,17 +1,23 @@
 # Weird Traveler
 
-**A big part of this code is written with AI.**
+A self-contained image (and video) toolkit built around two custom file formats:
+**WIF** (`.wif`, a simple, optionally-encrypted image format) and **WVF**
+(`.wvf`, an encrypted container that seals an ordinary video file).
 
-An image preview program with a custom file format '.wif'.
-
-The program is three Python scripts plus a shared core library:
+The suite is a CLI converter, two GUIs and shared libraries:
 
 | Program | Name | What it is |
 |---------|------|-----------|
-| `wif_converter.py` | — | Command-line converter: PNG/JPG/… → `.wif` (batch, recursive, encrypt) |
+| `wif_converter.py` | — | Command-line converter: PNG/JPG/… → `.wif` (batch, recursive, encrypt, filter) |
 | `wif_viewer.py` | **Weird Viewer** | A GUI image viewer (zoom, rotate, flip, animation playback, image adjustments, delete, export) |
-| `wif_browser.py` | **Weird Traveler** | A GUI thumbnail file browser (virtualized grid, previews, themes, keyboard nav, convert/encrypt) |
-| `wif_format.py` | — | Shared library — all encode/decode/encryption logic |
+| `wif_browser.py` | **Weird Traveler** | A GUI thumbnail file browser (virtualized grid, previews, themes, keyboard nav, tags, convert/encrypt) — also **plays, seals and decrypts `.wvf` video** |
+| `wif_format.py` | — | WIF core library — all image encode/decode/encryption logic |
+| `wif_filter.py` | — | PNG-style spatial filtering used by WIF **v3** |
+| `wvf/` | **Weird Video Format** | Library + CLI + player for `.wvf` — AES-256-GCM encrypted video containers |
+
+> Everything is plain Python + tkinter. It can run from source, or ship as a
+> single Windows executable — **`Weird Traveler.exe`** — that contains the
+> browser and the viewer (see [Building a single `.exe`](#building-a-single-exe)).
 
 
 ## Table of contents
@@ -21,9 +27,12 @@ The program is three Python scripts plus a shared core library:
 - [The converter (`wif_converter.py`)](#the-converter-wif_converterpy)
 - [The viewer — Weird Viewer (`wif_viewer.py`)](#the-viewer--weird-viewer-wif_viewerpy)
 - [The browser — Weird Traveler (`wif_browser.py`)](#the-browser--weird-traveler-wif_browserpy)
+- [WVF — encrypted video](#wvf--encrypted-video)
+- [Tags](#tags)
 - [Encryption & passwords](#encryption--passwords)
 - [Settings file](#settings-file)
 - [Using the library directly](#using-the-library-directly)
+- [Building a single `.exe`](#building-a-single-exe)
 - [Security notes & limitations](#security-notes--limitations)
 
 ---
@@ -36,32 +45,51 @@ Install the dependencies:
 pip install Pillow cryptography
 # optional extras:
 pip install pillow-avif-plugin   # read .avif input images
-pip install opencv-python        # real video thumbnails in the browser
+pip install opencv-python        # real video thumbnails (incl. .wvf) in the browser
+pip install numpy                # smaller files via WIF v3 spatial filtering
+pip install imageio-ffmpeg       # transcode video while sealing it into .wvf
 ```
 
 | Package | Needed for |
 |---------|-----------|
 | **Pillow** | Everything (image I/O) — required |
-| **cryptography** | WIF **v2** encryption/decryption — required to make or open encrypted files |
+| **cryptography** | WIF **v2** and **WVF** encryption/decryption — required to make or open any encrypted file |
 | **pillow-avif-plugin** | Reading `.avif` source images — optional |
-| **opencv-python** | Thumbnailing video files in the browser — optional (falls back to a play icon) |
+| **opencv-python** | Thumbnailing video files (and `.wvf` cover frames) in the browser — optional (falls back to a play icon) |
+| **numpy** | WIF **v3** spatial filtering (`--filter`, *Convert to WIF v3*) — optional (plain/compressed v3 still works without it) |
+| **imageio-ffmpeg** | Optional `--transcode` when sealing video into `.wvf` (shrink first) — optional |
 
-If `cryptography` is missing, plain (v0/v1) files still work; only encryption is
-disabled.
+If `cryptography` is missing, plain WIF (v1/v3) files still work; only encryption
+and all `.wvf` features are disabled.
+
+**Playing `.wvf` video** needs an **`ffplay`** binary (part of
+[FFmpeg](https://ffmpeg.org/)) on your `PATH` or next to the program — the
+decrypted stream is piped straight into it so no plaintext ever touches disk. If
+`ffplay` isn't found, the browser falls back to decrypting to a temporary file
+and opening it in your default player (the temp file is scrubbed afterwards).
 
 ---
 
 ## Project files
 
 ```
-wif_format.py        core library (import this, don't run it)
-wif_converter.py     CLI converter
+wif_format.py        WIF core library (import this, don't run it)
+wif_filter.py        PNG-style spatial filtering for WIF v3
+wif_converter.py     CLI converter (images → .wif)
 wif_viewer.py        Weird Viewer (GUI)
-wif_browser.py       Weird Traveler (GUI)
+wif_browser.py       Weird Traveler (GUI) — also plays/seals/decrypts .wvf
+wif_main.py          single-exe entry point (dispatches to browser or viewer)
+build.py             PyInstaller build script for Weird Traveler.exe
+wvf/                 Weird Video Format package:
+  ├─ core.py           encrypt/decrypt container logic (AES-256-GCM, STREAM)
+  ├─ codec.py          container/codec sniffing & helpers
+  ├─ converter.py      CLI:  python -m wvf.converter wrap|unwrap|info
+  └─ player.py         ffplay streaming + temp-file fallback player
 wif_icon.ico         app icon used by both GUIs
 wif_settings.json    browser settings (auto-created when "Remember settings" is on)
+wif_tags.json        tag database (auto-created when you first tag a file; encrypted if a password is set)
 temp.txt             scratch list written by the browser's "Append to temp.txt"
-WIF_FORMAT.md        byte-level format specification
+WIF_FORMAT.md        byte-level WIF format specification
 README.md            this file
 ```
 
@@ -83,7 +111,9 @@ python wif_converter.py photo.png --no-compress    # store raw pixels
 python wif_converter.py photos/ -r                 # walk subfolders, convert every image
 python wif_converter.py photos/ -r -d out/         # mirror the folder tree into out/
 python wif_converter.py photos/ -r --skip-existing # skip images already converted
+python wif_converter.py photo.png --filter         # smaller WIF v3 (spatial filtering + zlib)
 python wif_converter.py secret.png --encrypt       # write an encrypted v2 file
+python wif_converter.py secret.png --encrypt --filter # encrypted AND filtered
 ```
 
 ### Options
@@ -98,6 +128,8 @@ python wif_converter.py secret.png --encrypt       # write an encrypted v2 file
 | `--encrypt`, `--v2` | Write encrypted **v2** files |
 | `--password PW` | Password for `--encrypt` (otherwise prompted securely with no echo) |
 | `--no-compress` | Disable zlib compression |
+| `--filter` | Spatially filter pixels before compression for smaller files (writes **WIF v3**; needs numpy) |
+| `--filter-full` | Use the full 5-filter set: a little smaller, slower to decode. Implies `--filter` |
 
 **Recursive conversion** accepts these source extensions: `.png .jpg .jpeg .bmp
 .gif .tiff .tif .webp .ico .avif`. Without `-r`, folders are skipped.
@@ -211,8 +243,9 @@ widgets — so folders with thousands of files open and scroll smoothly.
 | Small / Large / Hover zoom | Cycle the thumbnail size mode (the label shows the *active* mode) |
 | Preview | Toggle **preview mode** (rich folder rows) |
 | Thumbnails: 1–8 | (preview mode only) how many sample thumbnails per folder |
-| Folders + … | Which files to show: **WIF**, **Media**, or **All files** |
+| Folders + … | Which files to show: **WIF/WVF**, **Media**, or **All files** |
 | Filter: | Live filename filter (`Ctrl+F` focuses it, `Esc` clears it) |
+| Tags: | Live tag filter — shows only files that have a matching tag (`Esc` clears it; clicking the field prompts for the tags password if the database is encrypted and not yet unlocked) |
 | path bar + Go | Type or paste a folder path and jump to it |
 
 ### ☰ Settings menu
@@ -225,6 +258,8 @@ widgets — so folders with thousands of files open and scroll smoothly.
 | Theme ▸ | **Light / Dark / Red** |
 | Hover-to-scrub previews | Enable/disable preview auto-scrub on hover (off by default) |
 | Remember settings | Persist theme, sort, size mode, filter & scrub across runs |
+| Show tags in cells | Toggle the `🏷 tag1, tag2` badge under thumbnails (on by default; saved with Remember settings) |
+| 🏷 Tag search… | Open the **global tag search** dialog (search all tagged files across all folders) |
 
 ### Thumbnail size modes
 
@@ -253,6 +288,8 @@ Samples are chosen deterministically (evenly spread, stable between visits).
 | `.wif` (plain) | Decoded image |
 | `.wif` (encrypted, unlocked) | Decoded image with a small 🔒 badge |
 | `.wif` (encrypted, locked) | A padlock placeholder (until you unlock it) |
+| `.wvf` (encrypted video, unlocked) | A representative decoded frame + play overlay (needs `opencv-python`), else a film/lock icon |
+| `.wvf` (encrypted video, locked) | A padlock film placeholder (until a known password unlocks it) |
 | Images | Normal thumbnail; GIFs get a "stacked frames" look |
 | Video | First frame + play overlay (needs `opencv-python`), else a play icon |
 | Audio | A note icon |
@@ -276,15 +313,19 @@ Samples are chosen deterministically (evenly spread, stable between visits).
 | Item | Action |
 |------|--------|
 | *(info line)* | Resolution of one file, or a selection summary |
-| Open | Folders open in Explorer; images/`.wif` open in a **Weird Viewer** window; others in their default app |
+| Open | Folders open in Explorer; images/`.wif` open in a **Weird Viewer** window; `.wvf` plays; others in their default app |
 | Open in viewer | Force the selected images/`.wif` into **Weird Viewer** windows (skips folders/other files) |
+| Play (video) | Decrypt & play the selected `.wvf` file(s) — streamed via `ffplay`, no plaintext on disk |
+| Seal to WVF 🔒… | Encrypt the selected plain video(s) into `.wvf` container(s) (uses/asks a password) |
+| Decrypt to video… | Restore the selected `.wvf` file(s) back to their original video |
 | Export to image… | Decode & save the selected files as PNG (one → Save dialog; many → pick a folder) |
-| Convert to WIF v1 | Encode the selected images to plain `.wif` |
-| Convert to WIF v2 — encrypted 🔒 | Encode to encrypted `.wif` (uses/asks a password) |
-| Encryption ▸ | **Encrypt to v2…**, **Change password…**, **Remove encryption (→ v1)…** for existing `.wif` files |
+| Convert to WIF v3 | Encode the selected images to a filtered, compressed `.wif` (v3; needs numpy) |
+| Convert to WIF v2 — encrypted 🔒 | Encode to an encrypted (and filtered) `.wif` (uses/asks a password) |
+| Encryption ▸ | **Encrypt to v2…**, **Change password…**, **Remove encryption (→ v3)…** for existing `.wif` files |
 | Show in Explorer | Open File Explorer with the item highlighted |
 | Copy path | Copy the full path(s) of the selection to the clipboard |
 | Append to temp.txt | Append `name path` of the selection to `temp.txt` next to the scripts |
+| Edit tags… | Add or edit comma-separated tags for the selected file(s) (hidden for pure folder selections) |
 | Delete | Securely delete (zeros + unlink); hidden if any folder is selected |
 
 ### The lightbox
@@ -310,6 +351,117 @@ Double-click an image (or a preview thumbnail) to open a full-window overlay:
 | `Del` | Securely delete the selected file(s) |
 | `Esc` | Close the lightbox |
 | mouse wheel | Scroll the grid (or flip lightbox images when it's open) |
+
+---
+
+## WVF — encrypted video
+
+**WVF** (`.wvf`) is the video sibling of WIF. Where WIF stores raw image pixels,
+WVF is a thin **encrypted container** that seals an *already-compressed* video
+file (H.264, H.265, AV1, …) exactly as-is. The bytes are sealed with
+**AES-256-GCM** under a key derived from your password with **scrypt**, written in
+chunks as a **STREAM** AEAD so arbitrarily large files encrypt and decrypt without
+loading the whole thing into memory.
+
+Nothing but the rough file size leaks without the password — not the frames, not
+the original filename, not even the container type.
+
+### In the browser (Weird Traveler)
+
+- **Double-click a `.wvf`** (or right-click → **Play**) — it's decrypted and
+  played. If `ffplay` is available the decrypted stream is piped straight into it,
+  so **no plaintext is ever written to disk**; otherwise it falls back to a
+  scrubbed temp file in your default player.
+- **Right-click a plain video → Seal to WVF 🔒…** — encrypt it into a `.wvf`.
+- **Right-click a `.wvf` → Decrypt to video…** — restore the original video.
+- `.wvf` files get a **decoded cover frame** thumbnail once unlocked (needs
+  `opencv-python`), or a padlock-film placeholder while locked. They share the
+  browser's **session passwords**, so unlocking one `.wvf` (or `.wif`) tries that
+  password on the rest.
+
+### From the command line
+
+The `wvf` package is also a standalone CLI:
+
+```bash
+python -m wvf.converter wrap   clip.mp4                 # -> clip.wvf (prompts for a password)
+python -m wvf.converter wrap   clip.mp4 -o sealed.wvf   # choose the output name
+python -m wvf.converter wrap   big.mov --transcode h264 --crf 24   # shrink first (needs imageio-ffmpeg)
+python -m wvf.converter unwrap clip.wvf -o out.mp4      # decrypt back to a video
+python -m wvf.converter info   clip.wvf                 # header info — no password needed
+python -m wvf.player           clip.wvf                 # decrypt & play (ffplay streaming)
+```
+
+### As a library
+
+```python
+from wvf import wrap_file, unwrap_file, peek, WrongPassword
+
+wrap_file("clip.mp4", "clip.wvf", "hunter2")
+meta = unwrap_file("clip.wvf", "out.mp4", password="hunter2")
+info = peek("clip.wvf")          # version / sizes — no password required
+```
+
+---
+
+## Tags
+
+The browser supports tagging any file with free-form labels. Tags are stored in
+`wif_tags.json` next to the scripts and — if a session password is available —
+**encrypted with AES-256-GCM + scrypt**, the same algorithm used by WIF v2 image
+files. Without the password, the database is unreadable.
+
+### Adding and editing tags
+
+Right-click one or more files and choose **Edit tags…**. A dialog appears
+pre-filled with the file's existing tags (or, for a multi-file selection, the tags
+common to all selected files). Type any comma-separated labels and press OK.
+
+Tags are stored **lower-case** and **deduplicated** automatically.
+Removing all tags from a file (clearing the field) deletes its entry.
+
+Tagged files show a small `🏷 tag1, tag2` line below their thumbnail and in the
+**status bar** when the file is selected. The badge can be hidden via
+**☰ → Show tags in cells** without losing the tags themselves.
+
+### Local tag filter (toolbar)
+
+The **Tags:** entry in the toolbar filters the current folder in real time —
+only files whose tags contain the typed text are shown. It works alongside the
+**Filter:** filename filter: both must match. Press `Esc` to clear it.
+
+### Global tag search (☰ → 🏷 Tag search…)
+
+Opens a dialog listing every tagged file known to the database:
+
+| Button | Action |
+|--------|--------|
+| *(search box)* | Type to narrow the list to files whose tags match |
+| **Go to folder** (or double-click) | Close the dialog and navigate the browser to the file's parent folder |
+| **Remove tags** | Strip all tags from the selected entry |
+
+Files that have been moved or deleted since they were tagged are shown with a
+`(file not found)` note and can be cleaned up with **Remove tags**.
+
+### Encrypted tag database
+
+Tags are stored **encrypted** whenever a session password is in memory:
+
+- **First launch / no file yet** — the database is created in plain JSON. As
+  soon as you add a password via **☰ → 🔑 Unlock…**, all future saves are
+  encrypted with that password.
+- **Subsequent launches** — if `wif_tags.json` is encrypted, the browser tries
+  every known session password silently. If none works, you are prompted each
+  time you interact with tags (click **Tags:**, open **Tag search**, or use
+  **Edit tags…**) until you either supply the correct password or the session ends.
+- **Wrong or cancelled password** — the prompt re-appears on the next tag
+  interaction. The encrypted file is never overwritten until you successfully
+  unlock it, so your data is always safe.
+- **Same password as your images** — if you unlock a `.wif` file before
+  touching the tag filter, the browser automatically tries that password on the
+  tag database too, so you usually won't be asked twice.
+
+Tags are cleaned up automatically when files are **securely deleted** from the browser.
 
 ---
 
@@ -354,7 +506,54 @@ When **Remember settings** is enabled in the browser, choices are saved to
 
 ## Using the library directly
 
-All encode/decode logic is in `wif_format.py`.
+All WIF encode/decode logic is in `wif_format.py` (spatial filtering for v3 lives
+in `wif_filter.py`); all WVF container logic is in the `wvf` package.
+
+```python
+import wif_format
+from PIL import Image
+
+# image -> .wif bytes  (version 1/3, optional compression / filtering / encryption)
+data = wif_format.encode(Image.open("photo.png"), filtered=True)
+open("photo.wif", "wb").write(data)
+
+# .wif bytes -> (PIL.Image, meta)
+img, meta = wif_format.decode(open("photo.wif", "rb").read())
+
+wif_format.peek(open("secret.wif", "rb").read())        # version/size info, no decode
+```
+
+```python
+from wvf import wrap_file, unwrap_file, peek            # see "WVF — encrypted video"
+```
+
+These libraries are designed to be imported and reused, not just driven from the
+GUIs — full signatures are in the module docstrings.
+
+---
+
+## Building a single `.exe`
+
+`wif_main.py` is a small entry point that dispatches to the browser or the viewer:
+
+```bash
+Weird Traveler.exe                  # Weird Traveler browser (current folder)
+Weird Traveler.exe  C:\Photos       # browser, starting in that folder
+Weird Traveler.exe  --viewer a.wif  # Weird Viewer for that file
+```
+
+`build.py` wraps it all into one Windows executable with **PyInstaller**:
+
+```bash
+pip install pyinstaller
+python build.py                     # -> dist/Weird Traveler.exe
+```
+
+The build bundles the browser, the viewer, the WIF/WVF libraries and the app icon
+into a single file. Optional dependencies that are installed at build time
+(`opencv-python`, `numpy`, `pillow-avif-plugin`, …) are baked in; `ffplay` is
+**not** bundled — for `.wvf` playback, keep an `ffplay` binary on `PATH` or beside
+the `.exe`.
 
 ---
 
@@ -362,7 +561,15 @@ All encode/decode logic is in `wif_format.py`.
 
 - **Passwords live only in RAM.** They're never written to disk by these tools.
 - **No metadata leaks** — WIF stores only raw pixels, so EXIF/GPS and other
-  metadata in the source image are dropped (a privacy plus over JPEG).
+  metadata in the source image are dropped (a privacy plus over JPEG). WVF seals
+  the video bytes whole and reveals only the rough file size — not the frames, the
+  original filename, or the container type.
+- **No plaintext on disk for `.wvf` playback** when `ffplay` is available: the
+  decrypted stream is piped straight into the player. The temp-file fallback is
+  scrubbed when the program exits.
 - **Format limits for WIF:** dimensions are 16-bit, so max **65 535 × 65 535 px**; pixels
   are 8-bit per channel (no 16-bit/HDR); channels are 3 (RGB) or 4 (RGBA, only
   when the image is genuinely transparent).
+- **WVF does not re-encode by default** — it seals your existing video losslessly.
+  The crypto is only as strong as your password; there's no recovery if you lose
+  it (that's the point).

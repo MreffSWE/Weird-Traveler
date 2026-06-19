@@ -67,6 +67,7 @@ class WifViewer:
         self._source_img = None   # original PIL image, never scaled
         self._tk_image = None     # currently displayed ImageTk
         self._current_path = None
+        self._file_size    = 0     # bytes of current file, cached at load (for infobar)
         self._siblings = []
         self._zoom = 1.0
         self._stretched = False
@@ -75,6 +76,19 @@ class WifViewer:
         self._flip_h    = False           # mirror left-right
         self._flip_v    = False           # mirror top-bottom
         self._fit_ratio = 1.0             # last fit-to-window ratio (keeps zoom continuous)
+        self._resize_job = None           # debounce token for <Configure> re-renders
+
+        # Viewport panning: we only ever resample the slice of the image that is
+        # actually on screen, so cost stays bounded by the window size no matter
+        # how far you zoom.  _view_x/_view_y is the viewport's top-left in
+        # displayed (zoomed) pixels; _virtual_w/_h is the full size at this zoom.
+        self._view_x = 0
+        self._view_y = 0
+        self._virtual_w = 0
+        self._virtual_h = 0
+        self._vleft = 0                   # virtual coord shown at canvas x=0 (zoom-to-cursor)
+        self._vtop  = 0
+        self._drag_origin = None          # (mouse_x, mouse_y, view_x, view_y) while dragging
 
         # Image adjustments — applied non-destructively by _apply_enhancements().
         # They persist as you navigate, so a folder shot in the same light stays
@@ -240,11 +254,10 @@ class WifViewer:
         frame.columnconfigure(0, weight=1)
 
         self.canvas = tk.Canvas(frame, bg="#1e1e1e", highlightthickness=0)
-        self._vbar = tk.Scrollbar(frame, orient=tk.VERTICAL,   command=self.canvas.yview)
-        self._hbar = tk.Scrollbar(frame, orient=tk.HORIZONTAL, command=self.canvas.xview)
-        self.canvas.configure(yscrollcommand=self._vbar.set,
-                              xscrollcommand=self._hbar.set,
-                              yscrollincrement=1, xscrollincrement=1)
+        # Scrollbars drive our own viewport pan (not the canvas's native scroll),
+        # because _render() only draws the visible slice — there's no big item to scroll.
+        self._vbar = tk.Scrollbar(frame, orient=tk.VERTICAL,   command=self._yview)
+        self._hbar = tk.Scrollbar(frame, orient=tk.HORIZONTAL, command=self._xview)
 
         self.canvas.grid(row=0, column=0, sticky="nsew")
         # scrollbars start hidden; _render() shows them when needed
@@ -253,8 +266,8 @@ class WifViewer:
         self.canvas.bind("<MouseWheel>",         self._on_scroll_y)
         self.canvas.bind("<Shift-MouseWheel>",   self._on_scroll_x)
         self.canvas.bind("<Control-MouseWheel>", self._on_ctrl_scroll)
-        # Re-render on resize so stretch mode keeps filling the canvas
-        self.canvas.bind("<Configure>", lambda e: self._render())
+        # Re-render on resize so stretch mode keeps filling the canvas (debounced)
+        self.canvas.bind("<Configure>", self._on_configure)
 
         # Click-and-drag panning
         self.canvas.bind("<ButtonPress-1>",   self._on_drag_start)
@@ -381,12 +394,15 @@ class WifViewer:
 
         self._source_img   = img
         self._current_path = path
+        self._file_size    = path.stat().st_size   # cached so _render needn't stat per frame
         self._file_info    = info
         self._stretched    = True
         self._zoom         = 1.0
         self._rotation     = 0    # each newly opened image starts un-rotated
         self._flip_h       = False
         self._flip_v       = False
+        self._view_x       = 0    # reset pan; stretch mode centres anyway
+        self._view_y       = 0
 
         # Extract frames for animated images (GIF, WebP, APNG, …)
         self._frames          = []
@@ -477,60 +493,113 @@ class WifViewer:
     def stretch(self):
         self._stretched = True
         self._zoom = 1.0
+        self._view_x = self._view_y = 0
         self._render()
 
     def unstretch(self):
         self._stretched = False
         self._render()
 
+    def _canvas_center(self):
+        return (self.canvas.winfo_width() // 2, self.canvas.winfo_height() // 2)
+
     def zoom_in(self):
-        if self._stretched:
-            self._zoom = self._fit_ratio   # continue from the size shown on screen
-        self._stretched = False
-        nxt = next((z for z in ZOOM_STEPS if z > self._zoom + 1e-6), None)
-        if nxt is not None:
-            self._zoom = nxt
-        self._render()
+        base = self._fit_ratio if self._stretched else self._zoom
+        target = next((z for z in ZOOM_STEPS if z > base + 1e-6), base)
+        self._zoom_to(target, *self._canvas_center())
 
     def zoom_out(self):
-        if self._stretched:
-            self._zoom = self._fit_ratio
-        self._stretched = False
-        prv = next((z for z in reversed(ZOOM_STEPS) if z < self._zoom - 1e-6), None)
-        if prv is not None:
-            self._zoom = prv
-        self._render()
+        base = self._fit_ratio if self._stretched else self._zoom
+        target = next((z for z in reversed(ZOOM_STEPS) if z < base - 1e-6), base)
+        self._zoom_to(target, *self._canvas_center())
 
     def zoom_reset(self):
+        self._zoom_to(1.0, *self._canvas_center())
+
+    def _cursor_fraction(self, px, py):
+        """Where the cursor sits on the source image, as (fx, fy) fractions.
+        Computed from the last render's geometry so a zoom can keep that point
+        fixed under the pointer.  Returns (None, None) before anything is drawn."""
+        if not self._virtual_w or not self._virtual_h:
+            return None, None
+        fx = (px + self._vleft) / self._virtual_w
+        fy = (py + self._vtop)  / self._virtual_h
+        return min(max(fx, 0.0), 1.0), min(max(fy, 0.0), 1.0)
+
+    def _zoom_to(self, new_zoom, px, py):
+        """Switch to `new_zoom`, keeping the image point under (px, py) fixed."""
+        fx, fy = self._cursor_fraction(px, py)
         self._stretched = False
-        self._zoom = 1.0
+        self._zoom = new_zoom
+        if fx is not None:
+            ow, oh = self._display_image().size
+            new_w = max(1, int(round(ow * new_zoom)))
+            new_h = max(1, int(round(oh * new_zoom)))
+            self._view_x = int(fx * new_w - px)
+            self._view_y = int(fy * new_h - py)
         self._render()
 
     def _on_drag_start(self, event):
         self.canvas.config(cursor="fleur")
-        self.canvas.scan_mark(event.x, event.y)
+        self._drag_origin = (event.x, event.y, self._view_x, self._view_y)
 
     def _on_drag_move(self, event):
-        self.canvas.scan_dragto(event.x, event.y, gain=3)
+        if self._drag_origin is None:
+            return
+        ox, oy, vx, vy = self._drag_origin
+        self._view_x = vx - (event.x - ox)   # drag right -> reveal content to the left
+        self._view_y = vy - (event.y - oy)
+        self._render()
 
     def _on_drag_end(self, event):
         self.canvas.config(cursor="")
+        self._drag_origin = None
 
     def _toggle_fullscreen(self):
         state = self.root.state()
         self.root.state("normal" if state == "zoomed" else "zoomed")
 
+    def _on_configure(self, _event):
+        """Debounce resize re-renders: dragging the window edge fires <Configure>
+        many times a second, and every _render() is a full LANCZOS resample."""
+        if self._resize_job is not None:
+            self.root.after_cancel(self._resize_job)
+        self._resize_job = self.root.after(60, self._render)
+
     def _on_ctrl_scroll(self, event):
+        """Zoom toward the cursor: keep whatever image point is under the pointer
+        in place instead of recentering the view on every zoom step."""
+        base = self._fit_ratio if self._stretched else self._zoom
         if event.delta > 0:
-            self.zoom_in()
+            target = next((z for z in ZOOM_STEPS if z > base + 1e-6), base)
         else:
-            self.zoom_out()
+            target = next((z for z in reversed(ZOOM_STEPS) if z < base - 1e-6), base)
+        self._zoom_to(target, event.x, event.y)
 
     def _on_scroll_y(self, event):
-        self.canvas.yview_scroll(int(-event.delta / 120) * 40, "units")
+        self._view_y -= int(event.delta / 120) * 60
+        self._render()
 
     def _on_scroll_x(self, event):
-        self.canvas.xview_scroll(int(-event.delta / 120) * 40, "units")
+        self._view_x -= int(event.delta / 120) * 60
+        self._render()
+
+    def _xview(self, op, value, what="units"):
+        """Horizontal scrollbar callback (moveto fraction, or scroll units/pages)."""
+        if op == "moveto":
+            self._view_x = int(float(value) * self._virtual_w)
+        else:  # "scroll"
+            step = self.canvas.winfo_width() if what == "pages" else 60
+            self._view_x += int(value) * step
+        self._render()
+
+    def _yview(self, op, value, what="units"):
+        if op == "moveto":
+            self._view_y = int(float(value) * self._virtual_h)
+        else:
+            step = self.canvas.winfo_height() if what == "pages" else 60
+            self._view_y += int(value) * step
+        self._render()
 
     # ------------------------------------------------------------------ GIF animation
 
@@ -647,10 +716,9 @@ class WifViewer:
         self._equalize     = False
         self._auto_balance = False
         self._suspend_render = False
-        self._on_adjust()
+        self._on_adjust()   # pulls slider values into state and re-renders once
         self._update_balance_btn()
         self._update_equalize_btn()
-        self._render()
 
     def _apply_enhancements(self, img):
         """Apply the active tonal/colour/sharpen adjustments to `img` (any size).
@@ -698,40 +766,70 @@ class WifViewer:
         img = self._display_image()
         orig_w, orig_h = img.size
 
-        if self._stretched:
-            cw = self.canvas.winfo_width()  or orig_w
-            ch = self.canvas.winfo_height() or orig_h
-            ratio = min(cw / orig_w, ch / orig_h)
-            self._fit_ratio = ratio   # remembered so zoom can continue from this size
-            new_size = (max(1, int(orig_w * ratio)), max(1, int(orig_h * ratio)))
-            display = img.resize(new_size, Image.LANCZOS)
-            zoom_label = f"{ratio*100:.0f}%"
-        else:
-            new_size = (max(1, int(orig_w * self._zoom)), max(1, int(orig_h * self._zoom)))
-            display = img.resize(new_size, Image.LANCZOS) if self._zoom != 1.0 else img
-            zoom_label = f"{self._zoom*100:.0f}%"
-
-        display = self._apply_enhancements(display)
-        self._tk_image = ImageTk.PhotoImage(display)
-        dw, dh = display.size
-
         cw = self.canvas.winfo_width()  or self.root.winfo_screenwidth()
         ch = self.canvas.winfo_height() or self.root.winfo_screenheight()
 
-        # Center image when it fits inside the canvas; otherwise anchor top-left for panning
-        x = cw // 2 if dw <= cw else dw // 2
-        y = ch // 2 if dh <= ch else dh // 2
+        if self._stretched:
+            ratio = min(cw / orig_w, ch / orig_h)
+            self._fit_ratio = ratio   # remembered so zoom can continue from this size
+        else:
+            ratio = self._zoom
+        zoom_label = f"{ratio*100:.0f}%"
 
-        self.canvas.config(scrollregion=(0, 0, max(dw, cw), max(dh, ch)))
+        # Full on-screen size at this zoom — the "virtual" image the viewport looks into.
+        Dw = max(1, int(round(orig_w * ratio)))
+        Dh = max(1, int(round(orig_h * ratio)))
+        self._virtual_w, self._virtual_h = Dw, Dh
+
+        # Keep the viewport inside the virtual image.
+        self._view_x = min(max(self._view_x, 0), max(0, Dw - cw))
+        self._view_y = min(max(self._view_y, 0), max(0, Dh - ch))
+
+        # Visible window in virtual coords; centre on any axis where the image fits.
+        if Dw <= cw:
+            vx0, vw, canvas_left = 0, Dw, (cw - Dw) // 2
+        else:
+            vx0, vw, canvas_left = self._view_x, cw, 0
+        if Dh <= ch:
+            vy0, vh, canvas_top = 0, Dh, (ch - Dh) // 2
+        else:
+            vy0, vh, canvas_top = self._view_y, ch, 0
+
+        # Crop the SOURCE to just what the viewport needs (pad 1px so edges don't gap),
+        # then resample only that slice — bounded by the window, not the zoom level.
+        cx0 = max(0, int(vx0 / ratio))
+        cy0 = max(0, int(vy0 / ratio))
+        cx1 = min(orig_w, int((vx0 + vw) / ratio) + 1)
+        cy1 = min(orig_h, int((vy0 + vh) / ratio) + 1)
+        crop = img.crop((cx0, cy0, cx1, cy1))
+
+        out_w = max(1, int(round((cx1 - cx0) * ratio)))
+        out_h = max(1, int(round((cy1 - cy0) * ratio)))
+        if (out_w, out_h) != crop.size:
+            resample = Image.LANCZOS if ratio < 1.0 else Image.BICUBIC
+            crop = crop.resize((out_w, out_h), resample)
+
+        crop = self._apply_enhancements(crop)
+        self._tk_image = ImageTk.PhotoImage(crop)
+
+        # Place the crop so its source-aligned position lands under the viewport.
+        draw_x = canvas_left + int(round(cx0 * ratio)) - vx0
+        draw_y = canvas_top  + int(round(cy0 * ratio)) - vy0
         self.canvas.delete("all")
-        self.canvas.create_image(x, y, anchor=tk.CENTER, image=self._tk_image)
+        self.canvas.create_image(draw_x, draw_y, anchor=tk.NW, image=self._tk_image)
 
-        # Show scrollbars only when the image exceeds the canvas size
-        if dw > cw:
+        # Virtual coord shown at canvas (0,0) — lets _cursor_fraction map clicks back.
+        self._vleft = vx0 - canvas_left
+        self._vtop  = vy0 - canvas_top
+
+        # Scrollbars: reflect pan position, shown only when the image overflows.
+        if Dw > cw:
+            self._hbar.set(self._view_x / Dw, (self._view_x + cw) / Dw)
             self._hbar.grid(row=1, column=0, sticky="ew")
         else:
             self._hbar.grid_remove()
-        if dh > ch:
+        if Dh > ch:
+            self._vbar.set(self._view_y / Dh, (self._view_y + ch) / Dh)
             self._vbar.grid(row=0, column=1, sticky="ns")
         else:
             self._vbar.grid_remove()
@@ -743,7 +841,7 @@ class WifViewer:
         self._zoom_var.set(zoom_label)
         self.info_var.set(
             f"{self._current_path.name}  |  {orig_w} × {orig_h}  |  "
-            f"{self._current_path.stat().st_size:,} bytes  |  {self._file_info}  |  "
+            f"{self._file_size:,} bytes  |  {self._file_info}  |  "
             f"{idx}/{total}"
         )
 

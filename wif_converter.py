@@ -7,13 +7,14 @@ Usage:
     python wif_converter.py image1.png image2.jpg
     python wif_converter.py image1.png image2.jpg -d output/folder
     python wif_converter.py image.png --no-compress
+    python wif_converter.py image.png --filter          (spatial filtering -> smaller WIF v3)
+    python wif_converter.py secret.png --encrypt --filter (encrypted AND filtered)
     python wif_converter.py photos/ -r                  (walk subfolders)
     python wif_converter.py photos/ -r -d converted/    (mirror tree into converted/)
     python wif_converter.py secret.png --encrypt        (write encrypted WIF v2)
 """
 
 import argparse
-import struct
 from pathlib import Path
 from PIL import Image
 
@@ -29,19 +30,24 @@ CONVERTIBLE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif",
                     ".tiff", ".tif", ".webp", ".ico", ".avif"}
 
 
-def convert(src: Path, dst: Path, compress: bool, version: int = 1, password=None):
+def convert(src: Path, dst: Path, compress: bool, version: int = 1, password=None,
+            filtered: bool = False, fast: bool = True):
     img  = Image.open(src)
-    data = wif_format.encode(img, version=version, compress=compress, password=password)
+    data = wif_format.encode(img, version=version, compress=compress, password=password,
+                             filtered=filtered, fast=fast)
     dst.write_bytes(data)
     if version == 2:
-        print(f"Converted: {src} -> {dst}  ({len(data):,} bytes, WIF v2 encrypted)")
+        tag = "encrypted" + (", filtered" if filtered else "")
+        print(f"Converted: {src} -> {dst}  ({len(data):,} bytes, WIF v2 {tag})")
     else:
-        # Read channels back from the written header for accurate reporting
-        channels = struct.unpack(">BHHBB", data[4:11])[3]
+        # Read metadata back from the written file (version-aware) for accurate reporting
+        info     = wif_format.peek(data)
+        channels = info["channels"]
         mode_str = {1: "L", 3: "RGB", 4: "RGBA"}.get(channels, f"{channels}ch")
         raw_size = img.size[0] * img.size[1] * channels
         saved    = 100 * (1 - len(data) / raw_size)
-        print(f"Converted: {src} -> {dst}  ({len(data):,} bytes, {saved:.1f}% smaller than raw, {mode_str})")
+        extra    = f", WIF v{info['version']}" + (", filtered" if info.get("filtered") else "")
+        print(f"Converted: {src} -> {dst}  ({len(data):,} bytes, {saved:.1f}% smaller than raw, {mode_str}{extra})")
 
 
 if __name__ == "__main__":
@@ -61,11 +67,18 @@ if __name__ == "__main__":
                         help="Password to use with --encrypt (otherwise prompted securely)")
     parser.add_argument("--no-compress", action="store_false", dest="compress",
                         help="Disable compression (compression is on by default)")
+    parser.add_argument("--filter", action="store_true",
+                        help="Spatially filter pixels before compression for smaller files (writes WIF v3)")
+    parser.add_argument("--filter-full", action="store_true",
+                        help="Use the full 5-filter set: a little smaller, slower to decode. Implies --filter")
     parser.set_defaults(compress=True)
     args = parser.parse_args()
 
     if args.output and args.output_dir:
         parser.error("-o/--output and -d/--output-dir cannot be used together")
+
+    filtered = args.filter or args.filter_full
+    fast     = not args.filter_full
 
     # Build the work list as (source_file, base_dir) pairs.  base_dir lets -d
     # mirror a folder's structure into the output directory.
@@ -123,7 +136,7 @@ if __name__ == "__main__":
             continue
 
         try:
-            convert(src, dst, args.compress, version, password)
+            convert(src, dst, args.compress, version, password, filtered, fast)
             n_done += 1
         except Exception as exc:
             print(f"Error converting {src}: {exc}")

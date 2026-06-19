@@ -3,8 +3,10 @@ Shared WIF format core — encoding/decoding for every .wif version.
 
 Versions
 --------
-v0 (legacy) : magic, width(H), height(H), channels(B), compressed(B)        — 10-byte header
 v1          : magic, version(B)=1, width(H), height(H), channels(B), compressed(B) — 11-byte header
+v3          : magic, version(B)=3, flags(B), width(H), height(H), channels(B)       — 11-byte header
+              flags = COMPRESSED | FILTERED; pixels are (optionally) spatially filtered, then
+              (optionally) zlib'd.  Decode reverses that order: unzip, then unfilter.
 v2          : magic, version(B)=2, flags(B), [log2_n(B), r(B), p(B) when flags&KDF],
               salt(16), nonce(12), AES-GCM(ciphertext+tag)
 
@@ -34,18 +36,26 @@ try:
     from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
     from cryptography.exceptions import InvalidTag
     _CRYPTO = True
-except ImportError:                       # crypto optional: v0/v1 still work without it
+except ImportError:                       # crypto optional: v1 (plain) still works without it
     _CRYPTO = False
 
     class InvalidTag(Exception):
         pass
 
+try:
+    import wif_filter                      # numpy-based spatial filtering for v3
+    _FILTER = True
+except ImportError:                        # numpy optional: only needed for filtered v3 files
+    _FILTER = False
+
 MAGIC           = b'w.if'
 FLAG_COMPRESSED = 0b001
 FLAG_ENCRYPTED  = 0b010
 FLAG_KDF        = 0b100      # v2 header carries its own scrypt parameters
-_VALID_V2_FLAGS = tuple(FLAG_ENCRYPTED | extra
-                        for extra in (0, FLAG_COMPRESSED, FLAG_KDF, FLAG_KDF | FLAG_COMPRESSED))
+FLAG_FILTERED   = 0b1000     # v3 payload ran through PNG-style spatial filtering (wif_filter)
+_VALID_V2_FLAGS = tuple(FLAG_ENCRYPTED | (FLAG_COMPRESSED * c) | (FLAG_KDF * k) | (FLAG_FILTERED * f)
+                        for c in (0, 1) for k in (0, 1) for f in (0, 1))
+_VALID_V3_FLAGS = (0, FLAG_COMPRESSED, FLAG_FILTERED, FLAG_COMPRESSED | FLAG_FILTERED)
 
 # scrypt cost for NEWLY written files (stored in each file, so it can be tuned
 # later without breaking existing ones).  Actual n = 2 ** log2_n.
@@ -95,42 +105,20 @@ def _normalize(img: Image.Image):
 
 # ── version detection ──────────────────────────────────────────────────────────
 
-def _is_valid_legacy(data: bytes) -> bool:
-    """True if `data` is a well-formed legacy v0 file (used to break the rare
-    tie where a v0 image's width high-byte equals a version number)."""
-    if len(data) < 10:
-        return False
-    width, height, channels, compressed = struct.unpack(">HHBB", data[4:10])
-    if channels not in (3, 4) or compressed not in (0, 1):
-        return False
-    body = data[10:]
-    expected = width * height * channels
-    if compressed == 0:
-        return len(body) == expected
-    try:
-        return len(zlib.decompress(body)) == expected
-    except zlib.error:
-        return False
-
-
 def detect_version(data: bytes) -> int:
-    """Return 0, 1 or 2.  Detection never needs a password."""
+    """Return 1, 2 or 3.  Detection never needs a password.
+
+    Every WIF file carries a version byte at offset 4, so detection is exact —
+    no heuristics (the old headerless v0 format is no longer supported)."""
     if data[:4] != MAGIC:
         raise ValueError("Not a .wif file")
-
-    # v2: version byte 2 + a valid encrypted-flags byte.  The only thing that
-    # could collide is a legacy image whose width high-byte is 2 (width 512-767),
-    # so confirm it isn't a well-formed legacy file first.
-    if (data[4] == 2 and len(data) >= 34 and data[5] in _VALID_V2_FLAGS
-            and not _is_valid_legacy(data)):
+    if data[4] == 2 and len(data) >= 34 and data[5] in _VALID_V2_FLAGS:
         return 2
-
-    # v1: version byte 1.  Channels sit at byte 9 (3 or 4); in a legacy file
-    # byte 9 is the 0/1 compressed flag, so a 3/4 there can only be v1.
-    if data[4] == 1 and len(data) >= 11 and data[9] in (3, 4) and data[10] in (0, 1):
+    if data[4] == 3 and len(data) >= 11 and data[5] in _VALID_V3_FLAGS:
+        return 3
+    if data[4] == 1 and len(data) >= 11:
         return 1
-
-    return 0
+    raise ValueError("Unsupported or corrupt WIF file (unknown version)")
 
 
 def is_encrypted(data: bytes) -> bool:
@@ -140,10 +128,14 @@ def is_encrypted(data: bytes) -> bool:
 # ── encode ───────────────────────────────────────────────────────────────────
 
 def encode(img: Image.Image, version: int = 1, compress: bool = True,
-           password=None) -> bytes:
+           password=None, filtered: bool = False, fast: bool = True) -> bytes:
+    if filtered and not _FILTER:
+        raise RuntimeError("Install numpy to use spatial filtering (wif_filter).")
     pil, channels = _normalize(img)
     width, height = pil.size
     pixels = pil.tobytes()
+    if filtered:                                  # spatial prediction BEFORE zlib
+        pixels = wif_filter.filter_pixels(pixels, width, height, channels, fast=fast)
     if compress:
         pixels = zlib.compress(pixels, level=6)
 
@@ -152,7 +144,9 @@ def encode(img: Image.Image, version: int = 1, compress: bool = True,
             raise RuntimeError("Install the 'cryptography' package to write encrypted WIF v2 files.")
         if not password:
             raise ValueError("A password is required to write a WIF v2 file.")
-        flags  = FLAG_ENCRYPTED | FLAG_KDF | (FLAG_COMPRESSED if compress else 0)
+        flags  = (FLAG_ENCRYPTED | FLAG_KDF
+                  | (FLAG_COMPRESSED if compress else 0)
+                  | (FLAG_FILTERED if filtered else 0))
         header = struct.pack(">4sBBBBB", MAGIC, 2, flags, _SCRYPT_LOG2_N, _SCRYPT_R, _SCRYPT_P)
         salt   = os.urandom(16)
         nonce  = os.urandom(12)
@@ -160,6 +154,10 @@ def encode(img: Image.Image, version: int = 1, compress: bool = True,
         key    = _derive_key(password, salt, 1 << _SCRYPT_LOG2_N, _SCRYPT_R, _SCRYPT_P)
         ciphertext = AESGCM(key).encrypt(nonce, inner, header)   # header (incl. params) authenticated
         return header + salt + nonce + ciphertext
+
+    if filtered or version == 3:
+        flags = (FLAG_COMPRESSED if compress else 0) | (FLAG_FILTERED if filtered else 0)
+        return struct.pack(">4sBBHHB", MAGIC, 3, flags, width, height, channels) + pixels
 
     # v1
     return struct.pack(">4sBHHBB", MAGIC, 1, width, height, channels, int(compress)) + pixels
@@ -169,9 +167,10 @@ def encode(img: Image.Image, version: int = 1, compress: bool = True,
 
 def decode(data: bytes, password=None):
     """Return (PIL.Image, meta dict).  meta has version, encrypted, compressed,
-    width, height, channels.  Raises WrongPassword for encrypted files when the
-    password is missing or wrong."""
+    filtered, width, height, channels.  Raises WrongPassword for encrypted files
+    when the password is missing or wrong."""
     version = detect_version(data)
+    filtered = False
 
     if version == 2:
         if not _CRYPTO:
@@ -202,13 +201,26 @@ def decode(data: bytes, password=None):
         pixels = inner[5:]
         if compressed:
             pixels = zlib.decompress(pixels)
-    else:
-        if version == 1:
-            width, height, channels, comp = struct.unpack(">HHBB", data[5:11])
-            body = data[11:]
-        else:
-            width, height, channels, comp = struct.unpack(">HHBB", data[4:10])
-            body = data[10:]
+        filtered = bool(flags & FLAG_FILTERED)
+        if filtered:
+            if not _FILTER:
+                raise RuntimeError("Install numpy to open spatially filtered WIF files.")
+            pixels = wif_filter.unfilter_pixels(pixels, width, height, channels)
+    elif version == 3:   # plain, optionally spatially filtered
+        flags      = data[5]
+        compressed = bool(flags & FLAG_COMPRESSED)
+        filtered   = bool(flags & FLAG_FILTERED)
+        width, height, channels = struct.unpack(">HHB", data[6:11])
+        pixels = data[11:]
+        if compressed:
+            pixels = zlib.decompress(pixels)
+        if filtered:
+            if not _FILTER:
+                raise RuntimeError("Install numpy to open spatially filtered (v3) WIF files.")
+            pixels = wif_filter.unfilter_pixels(pixels, width, height, channels)
+    else:   # v1 (plain)
+        width, height, channels, comp = struct.unpack(">HHBB", data[5:11])
+        body = data[11:]
         compressed = bool(comp)
         pixels = zlib.decompress(body) if compressed else body
 
@@ -218,7 +230,7 @@ def decode(data: bytes, password=None):
 
     img = Image.frombytes(_MODES[channels], (width, height), pixels)
     meta = {"version": version, "encrypted": version == 2, "compressed": compressed,
-            "width": width, "height": height, "channels": channels}
+            "filtered": filtered, "width": width, "height": height, "channels": channels}
     return img, meta
 
 
@@ -240,14 +252,17 @@ def decode_try(data: bytes, passwords):
 
 def peek(data: bytes) -> dict:
     """Cheap metadata without decryption or pixel work.  Returns version and
-    encrypted, plus width/height for v0/v1.  For encrypted v2, width/height are
+    encrypted, plus width/height for v1.  For encrypted v2, width/height are
     None (the dimensions live inside the ciphertext)."""
     version = detect_version(data)
     if version == 2:
         return {"version": 2, "encrypted": True, "width": None, "height": None}
-    if version == 1:
-        width, height, channels, comp = struct.unpack(">HHBB", data[5:11])
-    else:
-        width, height, channels, comp = struct.unpack(">HHBB", data[4:10])
+    if version == 3:
+        flags = data[5]
+        width, height, channels = struct.unpack(">HHB", data[6:11])
+        return {"version": 3, "encrypted": False, "width": width, "height": height,
+                "channels": channels, "compressed": bool(flags & FLAG_COMPRESSED),
+                "filtered": bool(flags & FLAG_FILTERED)}
+    width, height, channels, comp = struct.unpack(">HHBB", data[5:11])
     return {"version": version, "encrypted": False, "width": width, "height": height,
             "channels": channels, "compressed": bool(comp)}
