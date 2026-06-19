@@ -55,7 +55,7 @@ tries that password on the rest.
 | `wif_converter.py` | Command-line image → `.wif` converter (batch, recursive, encrypt, filter) |
 | `wif_format.py` + `wif_filter.py` | WIF core library + spatial filtering |
 | `wvf/` | Weird Video Format package — library, CLI (`python -m wvf.converter`), and player |
-| `wif_main.py` + `build.py` | Single-exe entry point + PyInstaller build → **`Weird Traveler.exe`** |
+| `wif_main.py` | Single-exe entry point |
 
 ---
 
